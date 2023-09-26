@@ -1,0 +1,255 @@
+// Unity Compute Shader
+#pragma kernel Connect
+
+#include "UnityCG.cginc"
+
+struct pointconnection
+{
+    int2 pointid;
+    float extension;
+};
+struct springs
+{
+    pointconnection strctural[4];
+    pointconnection shear[4];
+    pointconnection flexion[4];
+};
+int2 indexto2D(int index, int2 size)
+{
+    int2 pos;
+    pos.x = index % size.x;
+    pos.y = index / size.x;
+    //return -1 if out of bounds
+    if(pos.x < 0 || pos.x >= size.x || pos.y < 0 || pos.y >= size.y)
+    {
+        return int2(-1, -1);
+    }
+    return pos;
+}
+int convert2DTo1D(int2 pos, int2 size)
+{
+    //return -1 if out of bounds
+    if(pos.x < 0 || pos.x >= size.x || pos.y < 0 || pos.y >= size.y)
+    {
+        return -1;
+    }
+    return pos.x + pos.y * size.x;
+}
+// Input Mesh data
+StructuredBuffer<float3> InputBuffer : register(t0);
+struct particle
+{
+    float3 position;
+    float3 prevposition;
+};
+// Output Mesh data
+RWStructuredBuffer<particle> MovementBuffer : register(u0);
+RWStructuredBuffer<particle> PointBuffer : register(u1);
+RWStructuredBuffer<float4> ColorBuffer : register(u2);
+RWStructuredBuffer<springs> ClothBuffer : register(u3);
+int2 size;
+bool isPointWithinBounds(int2 pointe, int sizeX, int sizeY) {
+    return (pointe.x >= 0 && pointe.x < sizeX && pointe.y >= 0 && pointe.y < sizeY);
+}
+RWStructuredBuffer<float3> OutputDebugBuffer : register(u4);
+
+[numthreads(1, 1, 1)]
+void Connect (uint3 id : SV_DispatchThreadID)
+{  
+    uint index = convert2DTo1D(id.xy, size.x);
+    // Initialize point IDs for neighboring points
+    int x = id.x;
+    int y = id.y;
+
+
+    // Structural connections
+    ClothBuffer[index].strctural[0].pointid = int2(x, y + 1);
+    ClothBuffer[index].strctural[1].pointid = int2(x, y - 1);
+    ClothBuffer[index].strctural[2].pointid = int2(x + 1, y);
+    ClothBuffer[index].strctural[3].pointid = int2(x - 1, y);
+
+    // Shear connections
+    ClothBuffer[index].shear[0].pointid = int2(x + 1, y + 1);
+    ClothBuffer[index].shear[1].pointid = int2(x + 1, y - 1);
+    ClothBuffer[index].shear[2].pointid = int2(x - 1, y - 1);
+    ClothBuffer[index].shear[3].pointid = int2(x - 1, y + 1);
+
+    // Flexion connections
+    ClothBuffer[index].flexion[0].pointid = int2(x, y + 2);
+    ClothBuffer[index].flexion[1].pointid = int2(x, y - 2);
+    ClothBuffer[index].flexion[2].pointid = int2(x + 2, y);
+    ClothBuffer[index].flexion[3].pointid = int2(x - 2, y);
+
+    PointBuffer[index].position = InputBuffer[index];
+    PointBuffer[index].prevposition = InputBuffer[index];
+    //set the rest length of the springs to their current length
+    for (int i = 0; i < 4; i++) {
+    int2 srctid = ClothBuffer[index].strctural[i].pointid;
+    int2 shrid = ClothBuffer[index].shear[i].pointid;
+    int2 flexid = ClothBuffer[index].flexion[i].pointid;
+
+    // Check if the point is within bounds
+    if (isPointWithinBounds(srctid, size.x, size.y)) {
+        int srctindex = convert2DTo1D(srctid, size.x);
+        float dist = length(InputBuffer[index] - InputBuffer[srctindex]);
+        ClothBuffer[index].strctural[i].extension = 11.0f / size.x;
+        OutputDebugBuffer[1] = float3(dist, 0, 0);
+    }
+
+    if (isPointWithinBounds(shrid, size.x, size.y)) {
+        int shridindex = convert2DTo1D(shrid, size.x);
+        float dist = length(InputBuffer[index] - InputBuffer[shridindex]);
+        ClothBuffer[index].shear[i].extension = sqrt(2.0f) * 11.0f / size.x;
+        OutputDebugBuffer[2] = float3(dist, 0, 0);
+    }
+
+    if (isPointWithinBounds(flexid, size.x, size.y)) {
+        int flexidindex = convert2DTo1D(flexid, size.x);
+        float dist = length(InputBuffer[index] - InputBuffer[flexidindex]);
+        ClothBuffer[index].flexion[i].extension = 2.0f * 11.0f / size.x;
+        OutputDebugBuffer[3] = float3(dist, 0, 0);
+    }
+}
+
+
+
+}float adjustvalue;
+float3 pointselected;
+float mod;
+float dtprev;
+//is run 50 times per second
+RWStructuredBuffer<float3> ReuseBuffer : register(u4);
+float3 VerletSpring(int2 index)
+{
+    //get the rest length of the sprin
+    float3 springforce = float3(0, 0, 0);
+        // Loop over spring types
+    for (int s = 0; s < 3; s++) 
+    {
+        for (int i = 0; i < 4; i++) 
+        {
+            pointconnection connection;
+            switch (s)
+            {
+                case 0:
+                    connection = ClothBuffer[convert2DTo1D(index, size.x)].strctural[i];
+                    break;
+                case 1:
+                    connection = ClothBuffer[convert2DTo1D(index, size.x)].shear[i];
+                    break;
+                case 2:
+                    connection = ClothBuffer[convert2DTo1D(index, size.x)].flexion[i];
+                    break;
+                default:
+                    // Handle any other cases or errors
+                    break;
+            }   
+            int2 springId = connection.pointid;
+            // Check if the point is within bounds
+      if (isPointWithinBounds(springId, size.x, size.y)) {
+    int springIndex = convert2DTo1D(springId, size.x);
+    float restLength = connection.extension;
+
+    // Load point positions
+    float3 p1 = PointBuffer[convert2DTo1D(index, size.x)].position;
+    float3 p2 = PointBuffer[springIndex].position;
+    float3 lastp1 = PointBuffer[convert2DTo1D(index, size.x)].prevposition;
+    float3 lastp2 = PointBuffer[springIndex].prevposition;
+
+    // Calculate the offset
+    float3 diff = p1 - p2;
+    float dist = length(diff);
+    float diffFactor = (restLength - dist) / dist;
+    float3 offset = diff * diffFactor / restLength * 2.0f;
+
+    // Calculate the velocity-based spring force
+    float3 velocityCorrection = (p1 - lastp1 - p2 + lastp2) * -0.5f;
+    //apply damping
+    velocityCorrection *= 10.1f;
+    // Update springforce
+    springforce += offset + velocityCorrection;
+}
+
+        }
+    }return springforce;
+};
+
+
+
+#pragma kernel Move
+[numthreads(1, 1, 1)]
+void Move(uint3 id : SV_DispatchThreadID)
+{
+    float drag = 0.9f;
+    int2 pointid = int2(id.x, id.y);
+    uint index = convert2DTo1D(id.xy, size.x);
+    double mass = 100.0f / (size.x * size.x);
+    float3 pos = PointBuffer[index].position;
+    float3 gravity = float3(0, -0.09f, 0);
+    float dt = unity_DeltaTime.x ;
+    float3 force = VerletSpring(pointid);
+    AllMemoryBarrierWithGroupSync();
+    float3 acc = float3(force.x + gravity.x, force.y + gravity.y, force.z + gravity.z) / mass ;
+    float3 vel = pos - PointBuffer[index].prevposition;
+    acc += (pos - PointBuffer[index].prevposition); 
+    float3 prevpos = pos;
+    
+    pos = 2.0f * pos - PointBuffer[index].prevposition + acc * 0.01 * 0.01;
+    MovementBuffer[index].position = pos;
+    MovementBuffer[index].prevposition = prevpos;
+    // Update color buffer (for visualization)
+    ColorBuffer[index] = float4(id.x / float(size.x), id.y / float(size.x), 0, 1);
+
+}
+
+#pragma kernel Compress
+[numthreads(1, 1, 1)]
+void Compress(uint3 id : SV_DispatchThreadID) 
+{
+    uint index = convert2DTo1D(id.xy, size.x);
+    float3 pos = PointBuffer[index].position;
+    //apply the constraints
+    if(id.x == 0)
+    {
+        PointBuffer[index].position = float3(((float(id.y) / size.x * 10.12f) -5), 0, 5);
+        PointBuffer[index].prevposition = float3(((float(id.y) / size.x * 10.12f) -5), 0, 5);
+    }
+    
+   
+}
+#pragma kernel Apply
+[numthreads(1, 1, 1)]
+void Apply (uint3 id : SV_DispatchThreadID)
+{
+    uint index = convert2DTo1D(id.xy, size.x);
+    float3 pos = MovementBuffer[index].position;
+    float3 prev = MovementBuffer[index].prevposition ;
+    PointBuffer[index].position = pos;
+    PointBuffer[index].prevposition = prev;
+}
+
+#pragma kernel Clear
+[numthreads(1, 1, 1)]
+void Clear (uint3 id : SV_DispatchThreadID)
+{
+uint index = convert2DTo1D(id.xy, size.x);
+
+
+particle p;
+p.position = float3(0, 0, 0);
+p.prevposition = float3(0, 0, 0);
+PointBuffer[index] = p;
+ColorBuffer[index] = float4(0, 0, 0, 0);
+MovementBuffer[index] = p;
+for (int i = 0; i < 4; ++i) 
+{
+    ClothBuffer[index].strctural[i].pointid = int2(0, 0);
+    ClothBuffer[index].shear[i].pointid = int2(0, 0);
+    ClothBuffer[index].flexion[i].pointid = int2(0, 0);
+    ClothBuffer[index].strctural[i].extension = 0;
+    ClothBuffer[index].shear[i].extension = 0;
+    ClothBuffer[index].flexion[i].extension = 0;
+}
+
+
+}
